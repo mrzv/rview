@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, mpsc};
+use std::sync::{Arc, LazyLock, OnceLock, mpsc};
 
 /// Multiplier applied on each zoom step.
 const ZOOM_STEP: f64 = 1.25;
@@ -1061,10 +1061,19 @@ pub(crate) fn resize_to_exact(img: &DynamicImage, dst_w: u32, dst_h: u32) -> Rgb
     RgbaImage::from_raw(dst_w, dst_h, dst_image.into_vec()).unwrap_or_else(|| img.to_rgba8())
 }
 
+fn is_svg(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+}
+
 pub(crate) fn decode_image_with_hint(
     path: &Path,
     target: Option<(u32, u32)>,
 ) -> io::Result<DynamicImage> {
+    if is_svg(path) {
+        return decode_svg(path, target);
+    }
+
     // libjpeg-turbo is the fast path, but it rejects some JPEG variants the
     // pure-Rust decoder accepts (and vice versa), so a turbo failure falls
     // through to `image` rather than aborting. Remember turbo's error so that if
@@ -1101,6 +1110,59 @@ pub(crate) fn decode_image_with_hint(
             Err(io::Error::new(io::ErrorKind::InvalidData, fallback_error))
         }
     }
+}
+
+fn decode_svg(path: &Path, target: Option<(u32, u32)>) -> io::Result<DynamicImage> {
+    use resvg::{tiny_skia, usvg};
+
+    static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+        let mut fonts = usvg::fontdb::Database::new();
+        fonts.load_system_fonts();
+        Arc::new(fonts)
+    });
+    let options = usvg::Options {
+        resources_dir: path.parent().map(Path::to_path_buf),
+        fontdb: Arc::clone(&FONTS),
+        ..usvg::Options::default()
+    };
+    let data = std::fs::read(path)?;
+    let tree = usvg::Tree::from_data(&data, &options)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let size = tree.size();
+    // Match raster fit-to-window behavior: preserve aspect ratio, never upscale.
+    let scale = match target {
+        Some((w, h)) if w > 0 && h > 0 => (w as f32 / size.width())
+            .min(h as f32 / size.height())
+            .min(1.0),
+        _ => 1.0,
+    };
+    let width = ((size.width() * scale) as u32).max(1);
+    let height = ((size.height() * scale) as u32).max(1);
+    // Apply the raster decoder's allocation budget before tiny-skia allocates.
+    image::Limits::default()
+        .reserve_buffer(width, height, image::ColorType::Rgba8)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "invalid SVG image dimensions")
+    })?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let mut pixels = pixmap.take();
+    // tiny-skia produces premultiplied RGBA; image and Kitty need straight alpha.
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha > 0 && alpha < 255 {
+            for channel in &mut pixel[..3] {
+                *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha) as u8;
+            }
+        }
+    }
+    RgbaImage::from_raw(width, height, pixels)
+        .map(DynamicImage::ImageRgba8)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SVG image dimensions"))
 }
 
 #[cfg(feature = "turbo")]
@@ -1180,6 +1242,11 @@ fn decode_jpeg_turbo(path: &Path, target: Option<(u32, u32)>) -> io::Result<Dyna
 }
 
 fn get_cache_file_path(path: &Path, target_w: u32, target_h: u32) -> Option<PathBuf> {
+    // SVGs may reference other files or system fonts not covered by this key.
+    if is_svg(path) {
+        return None;
+    }
+
     use std::collections::hash_map::DefaultHasher;
     use std::fs;
     use std::hash::{Hash, Hasher};
@@ -1309,8 +1376,142 @@ mod tests {
     use super::{
         decode_image_with_hint, get_cache_file_path, resize_decoded_to_dims, resize_to_exact,
     };
-    use image::DynamicImage;
+    use image::{DynamicImage, GenericImageView};
     use std::fs;
+
+    #[test]
+    fn svg_renders_viewbox_at_target_size_with_straight_alpha() {
+        let path =
+            std::env::temp_dir().join(format!("rview-synthetic-alpha-{}.SVG", std::process::id()));
+        fs::write(
+            &path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50">
+                <rect width="50" height="50" fill="#ff0000" fill-opacity="0.5"/>
+            </svg>"##,
+        )
+        .unwrap();
+
+        let thumbnail = decode_image_with_hint(&path, Some((20, 20)))
+            .unwrap()
+            .into_rgba8();
+        let source = decode_image_with_hint(&path, None).unwrap();
+        let larger = decode_image_with_hint(&path, Some((200, 200))).unwrap();
+        let zero_target = decode_image_with_hint(&path, Some((0, 20))).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(thumbnail.dimensions(), (20, 10));
+        assert_eq!(thumbnail.get_pixel(5, 5).0, [255, 0, 0, 128]);
+        assert_eq!(thumbnail.get_pixel(15, 5).0, [0, 0, 0, 0]);
+        assert_eq!(source.dimensions(), (100, 50));
+        assert_eq!(larger.dimensions(), (100, 50));
+        assert_eq!(zero_target.dimensions(), (100, 50));
+    }
+
+    #[test]
+    fn svg_resolves_images_relative_to_its_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "rview-synthetic-svg-resources-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        image::RgbaImage::from_pixel(10, 10, image::Rgba([0, 255, 0, 255]))
+            .save(root.join("tile.png"))
+            .unwrap();
+        let path = root.join("image.svg");
+        fs::write(
+            &path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"
+                xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10">
+                <image width="10" height="10" xlink:href="tile.png"/>
+            </svg>"#,
+        )
+        .unwrap();
+        let image = decode_image_with_hint(&path, None).unwrap().into_rgba8();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(image.get_pixel(5, 5).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn svg_thumbnail_refreshes_when_a_referenced_image_changes() {
+        use super::App;
+        use crate::image_list::SharedImageList;
+        use crate::theme::Theme;
+        use ratatui::layout::Rect;
+
+        let root = std::env::temp_dir().join(format!(
+            "rview-synthetic-svg-thumbnail-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let resource = root.join("tile.png");
+        let source = root.join("image.SVG");
+        fs::write(
+            &source,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"
+                xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10">
+                <image width="10" height="10" xlink:href="tile.png"/>
+            </svg>"#,
+        )
+        .unwrap();
+        let mut pixels = Vec::new();
+        for color in [[0, 255, 0, 255], [0, 0, 255, 255]] {
+            image::RgbaImage::from_pixel(10, 10, image::Rgba(color))
+                .save(&resource)
+                .unwrap();
+            // A new viewer must not reuse a thumbnail of the old reference.
+            let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
+            app.spawn_thumb_decode(0, source.clone(), Rect::new(0, 0, 10, 10));
+            let (_, _, image) = app
+                .thumb_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            pixels.push(image.get_pixel(5, 5).0);
+        }
+        if let Some(cache) = get_cache_file_path(&source, 10, 10) {
+            let _ = fs::remove_file(cache);
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(pixels, [[0, 255, 0, 255], [0, 0, 255, 255]]);
+    }
+
+    #[test]
+    fn oversized_svg_rejects_intrinsic_decode_but_allows_bounded_rendering() {
+        let path = std::env::temp_dir().join(format!(
+            "rview-synthetic-oversized-{}.svg",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"
+                width="100000000" height="100000000">
+                <rect width="100000000" height="100000000" fill="red"/>
+            </svg>"#,
+        )
+        .unwrap();
+        let intrinsic = decode_image_with_hint(&path, None).unwrap_err();
+        let oversized_target =
+            decode_image_with_hint(&path, Some((100000000, 100000000))).unwrap_err();
+        let bounded = decode_image_with_hint(&path, Some((20, 20)))
+            .unwrap()
+            .into_rgba8();
+        fs::remove_file(path).unwrap();
+        assert_eq!(intrinsic.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(oversized_target.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(bounded.dimensions(), (20, 20));
+        assert_eq!(bounded.get_pixel(10, 10).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn malformed_svg_returns_invalid_data() {
+        let path = std::env::temp_dir().join(format!(
+            "rview-synthetic-malformed-{}.svg",
+            std::process::id()
+        ));
+        fs::write(&path, "<svg").unwrap();
+        let error = decode_image_with_hint(&path, None).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[cfg(feature = "turbo")]
     #[test]
