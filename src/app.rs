@@ -533,6 +533,34 @@ impl App {
         self.needs_render = true;
     }
 
+    /// Move the image with the pointer by a viewport-pixel displacement.
+    pub fn pan_pixels(&mut self, dx: f64, dy: f64) {
+        if self.zoom <= 1.0 {
+            return;
+        }
+        let Some(src) = self.source.as_ref() else {
+            return;
+        };
+        let (ow, oh) = src.dimensions();
+        if ow == 0.0 || oh == 0.0 {
+            return;
+        }
+        let (vw, vh) = self.viewport_pixels();
+        let crop = self.zoom_crop(src, vw, vh);
+        let previous = (self.pan_x, self.pan_y);
+        if crop.max_x > 0.0 {
+            self.pan_x -= dx / (crop.max_x * crop.scale);
+        }
+        if crop.max_y > 0.0 {
+            self.pan_y -= dy / (crop.max_y * crop.scale);
+        }
+        self.clamp_pan();
+        if previous != (self.pan_x, self.pan_y) {
+            self.zoom_dirty = true;
+            self.needs_render = true;
+        }
+    }
+
     fn clamp_pan(&mut self) {
         self.pan_x = self.pan_x.clamp(0.0, 1.0);
         self.pan_y = self.pan_y.clamp(0.0, 1.0);
@@ -999,7 +1027,7 @@ impl App {
         )
     }
 
-    /// Source crop geometry used by zoom rendering.
+    /// Source crop geometry, shared by zoom rendering and pointer-relative panning.
     fn zoom_crop(&self, src: &ZoomSource, vw: u32, vh: u32) -> ZoomCrop {
         let (ow, oh) = src.dimensions();
         let fit = f64::min(f64::from(vw) / ow, f64::from(vh) / oh);
@@ -1670,7 +1698,7 @@ mod tests {
         let view = app.build_zoom_view().unwrap();
         assert_eq!(view.get_pixel(75, 50).0, [255, 0, 0, 255]);
         assert_eq!(view.get_pixel(25, 50).0, [0, 0, 0, 0]);
-        app.pan_x = (46.875 - 0.5 / 16.0) / 93.75;
+        app.pan_pixels(0.5, 0.0);
         let shifted = app.build_zoom_view().unwrap();
         assert!(shifted.get_pixel(50, 50).0[3] > 0);
         assert!(shifted.get_pixel(50, 50).0[3] < 255);
@@ -1755,16 +1783,16 @@ mod tests {
         let view = app.build_zoom_view().unwrap();
         assert_eq!(view.get_pixel(3, 4).0, [255, 0, 0, 128]);
         assert_eq!(view.get_pixel(4, 4).0, [0, 0, 255, 128]);
-        app.pan_x = 5.0 / 12.0;
+        app.pan_pixels(2.0, 0.0);
         let dragged = app.build_zoom_view().unwrap();
         assert_eq!(dragged.get_pixel(5, 4).0, [255, 0, 0, 128]);
         assert_eq!(dragged.get_pixel(6, 4).0, [0, 0, 255, 128]);
-        app.pan(200.0, 0.0);
+        app.pan_pixels(-100.0, 0.0);
         assert_eq!(
             app.build_zoom_view().unwrap().get_pixel(0, 4).0,
             [0, 0, 255, 128]
         );
-        app.pan(-200.0, 0.0);
+        app.pan_pixels(100.0, 0.0);
         assert_eq!(
             app.build_zoom_view().unwrap().get_pixel(7, 4).0,
             [255, 0, 0, 128]
@@ -1931,6 +1959,61 @@ mod tests {
         app.zoom = 2.0;
         let view = app.build_zoom_view().expect("zoom view");
         assert_eq!(view.dimensions(), (100, 100));
+    }
+
+    #[test]
+    fn mouse_pan_tracks_pixels_and_clamps_at_image_edges() {
+        use super::App;
+        use crate::image_list::SharedImageList;
+        use crate::theme::Theme;
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
+        app.reset_zoom_state();
+        app.image_rect = Rect::new(0, 0, 100, 100);
+        app.source = Some(super::ZoomSource::Raster(DynamicImage::ImageRgba8(
+            image::RgbaImage::from_fn(200, 100, |x, y| image::Rgba([x as u8, y as u8, 0, 255])),
+        )));
+        app.zoom = 2.0;
+
+        let before = app.build_zoom_view().unwrap();
+        assert_eq!(before.get_pixel(0, 0).0, [50, 0, 0, 255]);
+        app.pan_pixels(10.0, 20.0);
+        let dragged = app.build_zoom_view().unwrap();
+        assert_eq!(dragged.get_pixel(0, 0).0, [40, 0, 0, 255]);
+        assert_eq!(dragged.get_pixel(99, 99).0, [139, 99, 0, 255]);
+
+        app.pan_pixels(1000.0, 0.0);
+        assert_eq!(
+            app.build_zoom_view().unwrap().get_pixel(0, 0).0,
+            [0, 0, 0, 255]
+        );
+        app.pan_pixels(-1000.0, 0.0);
+        assert_eq!(
+            app.build_zoom_view().unwrap().get_pixel(0, 0).0,
+            [100, 0, 0, 255]
+        );
+        app.reset_zoom();
+        let fit = app.build_zoom_view().unwrap();
+        app.pan_pixels(20.0, 20.0);
+        assert_eq!(app.build_zoom_view().unwrap(), fit);
+    }
+
+    #[test]
+    fn mouse_pan_accounts_for_fit_scale() {
+        use super::App;
+        use crate::image_list::SharedImageList;
+        use crate::theme::Theme;
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
+        app.reset_zoom_state();
+        app.image_rect = Rect::new(0, 0, 100, 50);
+        app.source = Some(super::ZoomSource::Raster(DynamicImage::new_rgba8(400, 200)));
+        app.zoom = 2.0;
+        app.pan_pixels(10.0, -5.0);
+        assert!((app.pan_x - 0.4).abs() < 1e-10);
+        assert!((app.pan_y - 0.6).abs() < 1e-10);
     }
 
     #[test]

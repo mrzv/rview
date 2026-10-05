@@ -15,7 +15,10 @@ use app::{App, ViewMode};
 use clap::Parser;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute, queue,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -50,9 +53,19 @@ impl TerminalSession {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut output = stdout();
-        if let Err(error) = execute!(output, EnterAlternateScreen, cursor::Hide) {
+        if let Err(error) = execute!(
+            output,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            cursor::Hide
+        ) {
             let _ = disable_raw_mode();
-            let _ = execute!(output, cursor::Show, LeaveAlternateScreen);
+            let _ = execute!(
+                output,
+                DisableMouseCapture,
+                cursor::Show,
+                LeaveAlternateScreen
+            );
             return Err(error);
         }
 
@@ -63,7 +76,12 @@ impl TerminalSession {
             }),
             Err(error) => {
                 let _ = disable_raw_mode();
-                let _ = execute!(stdout(), cursor::Show, LeaveAlternateScreen);
+                let _ = execute!(
+                    stdout(),
+                    DisableMouseCapture,
+                    cursor::Show,
+                    LeaveAlternateScreen
+                );
                 Err(error)
             }
         }
@@ -87,6 +105,7 @@ impl TerminalSession {
         }
         if let Err(error) = execute!(
             self.terminal.backend_mut(),
+            DisableMouseCapture,
             cursor::Show,
             LeaveAlternateScreen
         ) && first_error.is_none()
@@ -180,11 +199,12 @@ fn initial_dir_from_paths(paths: &[PathBuf]) -> PathBuf {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     let mut pending_emits: Vec<usize> = Vec::new();
+    let mut mouse_drag = None;
 
     loop {
         // 1. Drain all buffered input first so navigation is never blocked
         while event::poll(Duration::ZERO)? {
-            if handle_event(app, event::read()?)? {
+            if handle_event(app, event::read()?, &mut mouse_drag)? {
                 return Ok(());
             }
         }
@@ -274,9 +294,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     }
 }
 
-fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
+fn handle_event(
+    app: &mut App,
+    event: Event,
+    mouse_drag: &mut Option<(u16, u16)>,
+) -> io::Result<bool> {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
+            *mouse_drag = None;
             if app.help_visible {
                 app.help_visible = false;
                 app.needs_render = true;
@@ -480,10 +505,54 @@ fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
                 }
             }
         }
-        Event::Resize(_, _) => app.mark_dirty(),
+        Event::Mouse(mouse) => handle_mouse(app, mouse, mouse_drag),
+        Event::Resize(_, _) => {
+            *mouse_drag = None;
+            app.mark_dirty();
+        }
+        Event::FocusLost => *mouse_drag = None,
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent, drag: &mut Option<(u16, u16)>) {
+    if app.mode != ViewMode::Fullscreen
+        || app.help_visible
+        || app.pending_delete.is_some()
+        || app.theme_picker.is_some()
+    {
+        *drag = None;
+        return;
+    }
+
+    let inside = app
+        .image_rect
+        .contains(Position::new(mouse.column, mouse.row));
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            *drag = None;
+            if inside {
+                if mouse.kind == MouseEventKind::ScrollUp {
+                    app.zoom_in();
+                } else {
+                    app.zoom_out();
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) if inside && app.zoom > 1.0 => {
+            *drag = Some((mouse.column, mouse.row));
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some((column, row)) = *drag {
+                let dx = f64::from(i32::from(mouse.column) - i32::from(column));
+                let dy = f64::from(i32::from(mouse.row) - i32::from(row));
+                app.pan_pixels(dx * f64::from(app.cell_px.0), dy * f64::from(app.cell_px.1));
+                *drag = Some((mouse.column, mouse.row));
+            }
+        }
+        _ => *drag = None,
+    }
 }
 
 fn handle_theme_picker_key(app: &mut App, code: KeyCode) {
