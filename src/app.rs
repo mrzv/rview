@@ -58,6 +58,30 @@ impl ZoomSource {
             ),
         }
     }
+
+    /// Source crop geometry, shared by zoom rendering and pointer-relative panning.
+    fn crop(&self, zoom: f64, vw: u32, vh: u32) -> ZoomCrop {
+        let (ow, oh) = self.dimensions();
+        let fit = f64::min(f64::from(vw) / ow, f64::from(vh) / oh);
+        let scale = fit.min(1.0) * zoom;
+        let (width, height) = match self {
+            Self::Raster(_) => (
+                (f64::from(vw) / scale).round().clamp(1.0, ow),
+                (f64::from(vh) / scale).round().clamp(1.0, oh),
+            ),
+            Self::Svg(_) => (
+                (f64::from(vw) / scale).min(ow),
+                (f64::from(vh) / scale).min(oh),
+            ),
+        };
+        ZoomCrop {
+            width,
+            height,
+            max_x: ow - width,
+            max_y: oh - height,
+            scale,
+        }
+    }
 }
 
 struct ZoomCrop {
@@ -66,6 +90,80 @@ struct ZoomCrop {
     max_x: f64,
     max_y: f64,
     scale: f64,
+}
+
+struct ZoomRequest {
+    source: Arc<ZoomSource>,
+    index: usize,
+    rect: Rect,
+    cell_px: (u32, u32),
+    zoom: f64,
+    pan_x: f64,
+    pan_y: f64,
+}
+
+struct SvgZoomCache {
+    transform: resvg::tiny_skia::Transform,
+    pixmap: resvg::tiny_skia::Pixmap,
+}
+
+struct ZoomResult {
+    request: ZoomRequest,
+    cache: Option<SvgZoomCache>,
+    image: io::Result<RgbaImage>,
+}
+
+impl ZoomRequest {
+    fn matches(&self, app: &App) -> bool {
+        self.index == app.current
+            && self.rect == app.image_rect
+            && self.cell_px == app.cell_px
+            && self.zoom == app.zoom
+    }
+
+    fn render(&self, cache: &mut Option<SvgZoomCache>) -> io::Result<RgbaImage> {
+        let (vw, vh) = (
+            (u32::from(self.rect.width) * self.cell_px.0).max(1),
+            (u32::from(self.rect.height) * self.cell_px.1).max(1),
+        );
+        let (ow, oh) = self.source.dimensions();
+        if ow == 0.0 || oh == 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid image dimensions",
+            ));
+        }
+        let crop = self.source.crop(self.zoom, vw, vh);
+        let x = self.pan_x * crop.max_x;
+        let y = self.pan_y * crop.max_y;
+        let dst_w = ((crop.width * crop.scale).round() as u32).max(1).min(vw);
+        let dst_h = ((crop.height * crop.scale).round() as u32).max(1).min(vh);
+        match self.source.as_ref() {
+            ZoomSource::Raster(image) => {
+                let cropped = image.crop_imm(
+                    x.round() as u32,
+                    y.round() as u32,
+                    crop.width as u32,
+                    crop.height as u32,
+                );
+                Ok(resize_to_exact(&cropped, dst_w, dst_h))
+            }
+            ZoomSource::Svg(tree) => render_svg_cached(
+                tree,
+                dst_w,
+                dst_h,
+                resvg::tiny_skia::Transform::from_row(
+                    crop.scale as f32,
+                    0.0,
+                    0.0,
+                    crop.scale as f32,
+                    -(x * crop.scale) as f32,
+                    -(y * crop.scale) as f32,
+                ),
+                cache,
+            ),
+        }
+    }
 }
 
 pub struct App {
@@ -95,6 +193,7 @@ pub struct App {
     pub current: usize,
     pub prefetcher: Prefetcher,
     pub loaded: Option<RgbaImage>,
+    pub loaded_revision: u64,
     pub error: Option<String>,
     pub needs_render: bool,
     pub image_rect: Rect,
@@ -111,10 +210,13 @@ pub struct App {
     pan_y: f64,
     zoom_dirty: bool,
     /// Original raster pixels or a parsed SVG retained for rendering zoomed views.
-    source: Option<ZoomSource>,
+    source: Option<Arc<ZoomSource>>,
     source_for: Option<usize>,
     source_rx: Option<mpsc::Receiver<io::Result<ZoomSource>>>,
     source_target: Option<usize>,
+    // One render in flight; input updates replace desired geometry, never queue jobs.
+    zoom_rx: Option<mpsc::Receiver<ZoomResult>>,
+    zoom_cache: Option<SvgZoomCache>,
 
     #[cfg(feature = "video")]
     pub video: Option<crate::video::VideoPlayback>,
@@ -168,6 +270,7 @@ impl App {
             current: 0,
             prefetcher: Prefetcher::new(),
             loaded: None,
+            loaded_revision: 0,
             error: None,
             needs_render: true,
             image_rect: Rect::default(),
@@ -183,6 +286,8 @@ impl App {
             source_for: None,
             source_rx: None,
             source_target: None,
+            zoom_rx: None,
+            zoom_cache: None,
             #[cfg(feature = "video")]
             video: None,
             shared_list,
@@ -338,7 +443,7 @@ impl App {
         self.thumb_generation += 1;
         self.prefetcher.invalidate();
         self.graphics_storage_dirty = true;
-        self.loaded = None;
+        self.set_loaded(None);
         self.needs_render = true;
     }
 
@@ -393,7 +498,7 @@ impl App {
             self.needs_render = true;
             self.fullscreen_rx = None;
             self.fullscreen_target = None;
-            self.loaded = None;
+            self.set_loaded(None);
             self.reset_zoom_state();
         }
     }
@@ -454,16 +559,18 @@ impl App {
                 if idx == self.current
                     && rect == self.image_rect
                     && self.mode == ViewMode::Fullscreen
+                    && self.zoom == 1.0
                 {
                     match result {
                         Ok(img) => {
-                            self.loaded = Some(img);
+                            self.set_loaded(Some(img));
                             self.error = None;
                             self.loaded_for_rect = rect;
                             self.needs_render = true;
                         }
                         Err(e) => {
                             self.error = Some(e.to_string());
+                            self.needs_render = true;
                         }
                     }
                 }
@@ -486,6 +593,7 @@ impl App {
         self.source_for = None;
         self.source_rx = None;
         self.source_target = None;
+        self.zoom_cache = None;
     }
 
     /// Return to fit-to-window, keeping the cached source for fast re-zoom.
@@ -546,7 +654,7 @@ impl App {
             return;
         }
         let (vw, vh) = self.viewport_pixels();
-        let crop = self.zoom_crop(src, vw, vh);
+        let crop = src.crop(self.zoom, vw, vh);
         let previous = (self.pan_x, self.pan_y);
         if crop.max_x > 0.0 {
             self.pan_x -= dx / (crop.max_x * crop.scale);
@@ -585,24 +693,77 @@ impl App {
     pub fn poll_source(&mut self) -> bool {
         let result = self.source_rx.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some(result) = result {
-            let idx = self.source_target.take();
+            let idx = self.source_target;
             self.source_rx = None;
-            if let (Some(idx), Ok(img)) = (idx, result) {
-                if idx == self.current {
-                    self.source = Some(img);
-                    self.source_for = Some(idx);
-                    self.zoom_dirty = true;
-                    self.needs_render = true;
+            if idx == Some(self.current) {
+                match result {
+                    Ok(source) => {
+                        self.source = Some(Arc::new(source));
+                        self.source_for = idx;
+                        self.zoom_dirty = true;
+                    }
+                    Err(error) if self.mode == ViewMode::Fullscreen && self.zoom > 1.0 => {
+                        self.set_loaded(None);
+                        self.error = Some(error.to_string());
+                    }
+                    Err(_) => self.source_target = None,
                 }
+                self.needs_render = true;
             }
             return true;
         }
         false
     }
 
+    /// Poll one background zoom render, discarding obsolete image/geometry results.
+    pub fn poll_zoom(&mut self) -> bool {
+        let result = self.zoom_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        let Some(result) = result else {
+            return false;
+        };
+        self.zoom_rx = None;
+        let same_source = self
+            .source
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, &result.request.source));
+        if same_source && self.mode == ViewMode::Fullscreen && self.zoom > 1.0 {
+            self.zoom_cache = result.cache;
+            let same_pan = result.request.pan_x == self.pan_x && result.request.pan_y == self.pan_y;
+            if result.request.matches(self) {
+                match result.image {
+                    Ok(image) => {
+                        self.set_loaded(Some(image));
+                        self.error = None;
+                    }
+                    Err(error) if same_pan => {
+                        self.set_loaded(None);
+                        self.error = Some(error.to_string());
+                    }
+                    Err(_) => {}
+                }
+                self.loaded_for_rect = self.image_rect;
+                // Publish completed motion in order rather than starving continuous
+                // drags. The desired pan stays untouched; catch up after this frame.
+                self.zoom_dirty = !same_pan;
+            } else {
+                self.zoom_dirty = true;
+            }
+            self.needs_render = true;
+        } else if self.mode == ViewMode::Fullscreen && self.zoom > 1.0 {
+            self.zoom_dirty = true;
+            self.needs_render = true;
+        }
+        true
+    }
+
+    /// Keep the previous graphics visible while source or zoom work is outstanding.
+    pub fn zoom_render_pending(&self) -> bool {
+        self.zoom > 1.0 && (self.source_rx.is_some() || self.zoom_rx.is_some())
+    }
+
     pub fn enter_gallery(&mut self) {
         self.mode = ViewMode::Gallery;
-        self.loaded = None;
+        self.set_loaded(None);
         self.needs_render = true;
     }
 
@@ -748,7 +909,7 @@ impl App {
         self.graphics_storage_dirty = true;
         self.fullscreen_rx = None;
         self.fullscreen_target = None;
-        self.loaded = None;
+        self.set_loaded(None);
 
         self.delete_error = if errors.is_empty() {
             None
@@ -830,7 +991,7 @@ impl App {
         self.graphics_storage_dirty = true;
         self.fullscreen_rx = None;
         self.fullscreen_target = None;
-        self.loaded = None;
+        self.set_loaded(None);
         self.error = None;
 
         if let Some(ref mut p) = self.picker {
@@ -883,7 +1044,7 @@ impl App {
         #[cfg(feature = "video")]
         if crate::video::is_video(&self.images[self.current]) {
             self.mode = ViewMode::Video;
-            self.loaded = None;
+            self.set_loaded(None);
             return;
         }
 
@@ -892,10 +1053,10 @@ impl App {
             .prefetcher
             .take_resized(self.current, self.image_rect, self.cell_px)
         {
-            self.loaded = Some(img);
+            self.set_loaded(Some(img));
             self.loaded_for_rect = self.image_rect;
         } else {
-            self.loaded = None;
+            self.set_loaded(None);
             self.start_fullscreen_decode(self.current, self.image_rect);
         }
     }
@@ -953,7 +1114,7 @@ impl App {
     }
 
     pub fn mark_dirty(&mut self) {
-        self.loaded = None;
+        self.set_loaded(None);
         self.thumb_cache.clear();
         self.thumb_loading.clear();
         self.thumb_generation += 1;
@@ -970,18 +1131,21 @@ impl App {
                     || (self.loaded.is_none() && self.error.is_none())
                     || self.loaded_for_rect != self.image_rect
                 {
-                    match self.build_zoom_view() {
-                        Ok(view) => {
-                            self.loaded = Some(view);
-                            self.error = None;
-                        }
-                        Err(error) => {
-                            self.loaded = None;
-                            self.error = Some(error.to_string());
-                        }
+                    if self.zoom_rx.is_none() {
+                        let request = self.zoom_request();
+                        let mut cache = self.zoom_cache.take();
+                        let (tx, rx) = mpsc::channel();
+                        self.zoom_rx = Some(rx);
+                        rayon::spawn(move || {
+                            let image = request.render(&mut cache);
+                            let _ = tx.send(ZoomResult {
+                                request,
+                                cache,
+                                image,
+                            });
+                        });
+                        self.zoom_dirty = false;
                     }
-                    self.loaded_for_rect = self.image_rect;
-                    self.zoom_dirty = false;
                 }
                 return;
             }
@@ -990,10 +1154,18 @@ impl App {
             if self.source_target != Some(self.current) {
                 self.start_source_decode(self.current);
             }
+            if self.source_rx.is_none() {
+                // Keep an active source failure visible instead of replacing it
+                // with another fit decode.
+                self.zoom_dirty = false;
+                return;
+            }
             self.zoom_dirty = false;
             if self.loaded.is_some() {
                 return;
             }
+        } else if self.source_rx.is_none() {
+            self.source_target = None;
         }
 
         if self.loaded.is_some() && self.loaded_for_rect == self.image_rect && !self.zoom_dirty {
@@ -1005,7 +1177,7 @@ impl App {
             .prefetcher
             .take_resized(self.current, self.image_rect, self.cell_px)
         {
-            self.loaded = Some(img);
+            self.set_loaded(Some(img));
             self.error = None;
             self.loaded_for_rect = self.image_rect;
             return;
@@ -1027,75 +1199,26 @@ impl App {
         )
     }
 
-    /// Source crop geometry, shared by zoom rendering and pointer-relative panning.
-    fn zoom_crop(&self, src: &ZoomSource, vw: u32, vh: u32) -> ZoomCrop {
-        let (ow, oh) = src.dimensions();
-        let fit = f64::min(f64::from(vw) / ow, f64::from(vh) / oh);
-        let scale = fit.min(1.0) * self.zoom;
-        let (width, height) = match src {
-            ZoomSource::Raster(_) => (
-                (f64::from(vw) / scale).round().clamp(1.0, ow),
-                (f64::from(vh) / scale).round().clamp(1.0, oh),
-            ),
-            // Vector crops have no source-pixel grid or minimum one-pixel extent.
-            ZoomSource::Svg(_) => (
-                (f64::from(vw) / scale).min(ow),
-                (f64::from(vh) / scale).min(oh),
-            ),
-        };
-        ZoomCrop {
-            width,
-            height,
-            max_x: ow - width,
-            max_y: oh - height,
-            scale,
+    fn set_loaded(&mut self, image: Option<RgbaImage>) {
+        self.loaded = image;
+        self.loaded_revision = self.loaded_revision.wrapping_add(1);
+    }
+
+    fn zoom_request(&self) -> ZoomRequest {
+        ZoomRequest {
+            source: Arc::clone(self.source.as_ref().expect("loaded zoom source")),
+            index: self.current,
+            rect: self.image_rect,
+            cell_px: self.cell_px,
+            zoom: self.zoom,
+            pan_x: self.pan_x,
+            pan_y: self.pan_y,
         }
     }
 
-    /// Render a zoomed, panned viewport without rasterizing SVGs at intrinsic size.
+    #[cfg(test)]
     fn build_zoom_view(&self) -> io::Result<RgbaImage> {
-        let src = self
-            .source
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "zoom source is not loaded"))?;
-        let (ow, oh) = src.dimensions();
-        if ow == 0.0 || oh == 0.0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid image dimensions",
-            ));
-        }
-        let (vw, vh) = self.viewport_pixels();
-        let crop = self.zoom_crop(src, vw, vh);
-        let x = self.pan_x * crop.max_x;
-        let y = self.pan_y * crop.max_y;
-        let dst_w = ((crop.width * crop.scale).round() as u32).max(1).min(vw);
-        let dst_h = ((crop.height * crop.scale).round() as u32).max(1).min(vh);
-
-        match src {
-            ZoomSource::Raster(image) => {
-                let cropped = image.crop_imm(
-                    x.round() as u32,
-                    y.round() as u32,
-                    crop.width as u32,
-                    crop.height as u32,
-                );
-                Ok(resize_to_exact(&cropped, dst_w, dst_h))
-            }
-            ZoomSource::Svg(tree) => render_svg_viewport(
-                tree,
-                dst_w,
-                dst_h,
-                resvg::tiny_skia::Transform::from_row(
-                    crop.scale as f32,
-                    0.0,
-                    0.0,
-                    crop.scale as f32,
-                    -(x * crop.scale) as f32,
-                    -(y * crop.scale) as f32,
-                ),
-            ),
-        }
+        self.zoom_request().render(&mut None)
     }
 }
 
@@ -1262,20 +1385,16 @@ fn decode_svg(path: &Path, target: Option<(u32, u32)>) -> io::Result<DynamicImag
     .map(DynamicImage::ImageRgba8)
 }
 
-/// Keep filter inputs outside the visible crop available to resvg's layer renderer.
-fn render_svg_viewport(
+/// Cache exact-resolution SVG pixels; integer mouse movement only changes the crop.
+fn render_svg_cached(
     tree: &resvg::usvg::Tree,
     width: u32,
     height: u32,
     mut transform: resvg::tiny_skia::Transform,
+    cache: &mut Option<SvgZoomCache>,
 ) -> io::Result<RgbaImage> {
-    if tree.filters().is_empty() {
-        return render_svg(tree, width, height, transform, None);
-    }
-
-    // resvg bounds intermediate filter layers relative to the destination canvas.
-    // Render the scaled document before cropping so off-screen inputs can contribute
-    // to visible effects. Integer padding preserves the viewport's subpixel phase.
+    let viewport_transform = transform;
+    // Keep the fractional phase in the canvas; never interpolate a cached raster.
     let left = (-transform.tx).ceil().max(0.0) as u32;
     let top = (-transform.ty).ceil().max(0.0) as u32;
     let crop = resvg::tiny_skia::IntRect::from_xywh(left as i32, top as i32, width, height)
@@ -1286,7 +1405,32 @@ fn render_svg_viewport(
         .max(crop.right() as u32);
     let full_height = ((tree.size().height() * transform.sy + transform.ty).ceil() as u32)
         .max(crop.bottom() as u32);
-    render_svg(tree, full_width, full_height, transform, Some(crop))
+    if let Err(error) = reserve_svg_buffers(full_width, full_height, Some(crop)) {
+        *cache = None;
+        if tree.filters().is_empty() {
+            // Large unfiltered drawings still render only their visible viewport.
+            return render_svg(tree, width, height, viewport_transform, None);
+        }
+        return Err(error);
+    }
+    let reusable = cache.as_ref().is_some_and(|cached| {
+        cached.transform == transform
+            && cached.pixmap.width() == full_width
+            && cached.pixmap.height() == full_height
+    });
+    if !reusable {
+        // Release the old canvas before allocating a new zoom/phase.
+        *cache = None;
+        let pixmap = render_svg_pixmap(tree, full_width, full_height, transform)?;
+        *cache = Some(SvgZoomCache { transform, pixmap });
+    }
+    let viewport = cache
+        .as_ref()
+        .unwrap()
+        .pixmap
+        .clone_rect(crop)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SVG crop dimensions"))?;
+    rgba_from_pixmap(viewport)
 }
 
 fn render_svg(
@@ -1296,9 +1440,23 @@ fn render_svg(
     transform: resvg::tiny_skia::Transform,
     crop: Option<resvg::tiny_skia::IntRect>,
 ) -> io::Result<RgbaImage> {
-    use resvg::tiny_skia;
+    reserve_svg_buffers(width, height, crop)?;
+    let pixmap = render_svg_pixmap(tree, width, height, transform)?;
+    let pixmap = if let Some(crop) = crop {
+        pixmap.clone_rect(crop).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid SVG crop dimensions")
+        })?
+    } else {
+        pixmap
+    };
+    rgba_from_pixmap(pixmap)
+}
 
-    // Apply the raster decoder's allocation budget before tiny-skia allocates.
+fn reserve_svg_buffers(
+    width: u32,
+    height: u32,
+    crop: Option<resvg::tiny_skia::IntRect>,
+) -> io::Result<()> {
     let mut limits = image::Limits::default();
     limits
         .reserve_buffer(width, height, image::ColorType::Rgba8)
@@ -1308,19 +1466,23 @@ fn render_svg(
             .reserve_buffer(crop.width(), crop.height(), image::ColorType::Rgba8)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     }
-    let mut pixmap = tiny_skia::Pixmap::new(width, height).ok_or_else(|| {
+    Ok(())
+}
+
+fn render_svg_pixmap(
+    tree: &resvg::usvg::Tree,
+    width: u32,
+    height: u32,
+    transform: resvg::tiny_skia::Transform,
+) -> io::Result<resvg::tiny_skia::Pixmap> {
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "invalid SVG image dimensions")
     })?;
     resvg::render(tree, transform, &mut pixmap.as_mut());
-    let pixmap = if let Some(crop) = crop {
-        let viewport = pixmap.clone_rect(crop).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid SVG crop dimensions")
-        })?;
-        drop(pixmap);
-        viewport
-    } else {
-        pixmap
-    };
+    Ok(pixmap)
+}
+
+fn rgba_from_pixmap(pixmap: resvg::tiny_skia::Pixmap) -> io::Result<RgbaImage> {
     let (width, height) = (pixmap.width(), pixmap.height());
     let mut pixels = pixmap.take();
     // tiny-skia produces premultiplied RGBA; image and Kitty need straight alpha.
@@ -1550,6 +1712,168 @@ mod tests {
     use image::{DynamicImage, GenericImageView};
     use std::fs;
 
+    fn load_zoom(app: &mut super::App) {
+        use std::time::{Duration, Instant};
+        app.mode = super::ViewMode::Fullscreen;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        app.load_if_needed();
+        while app.zoom_render_pending() {
+            assert!(Instant::now() < deadline, "zoom render timed out");
+            std::thread::sleep(Duration::from_millis(1));
+            app.poll_zoom();
+            app.load_if_needed();
+        }
+    }
+
+    #[test]
+    fn obsolete_zoom_results_do_not_overwrite_new_pan_or_image() {
+        use super::{App, ZoomResult, ZoomSource};
+        use crate::image_list::SharedImageList;
+        use crate::theme::Theme;
+        use ratatui::layout::Rect;
+        use std::sync::{Arc, mpsc};
+
+        let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
+        app.reset_zoom_state();
+        app.image_rect = Rect::new(0, 0, 100, 100);
+        app.source = Some(Arc::new(ZoomSource::Raster(DynamicImage::ImageRgba8(
+            image::RgbaImage::from_fn(200, 100, |x, _| image::Rgba([x as u8, 0, 0, 255])),
+        ))));
+        app.source_for = Some(0);
+        app.zoom = 2.0;
+        load_zoom(&mut app);
+
+        app.pan_pixels(-10.0, 0.0);
+        let request = app.zoom_request();
+        let image = request.render(&mut None);
+        let (tx, rx) = mpsc::channel();
+        app.zoom_rx = Some(rx);
+        app.pan_pixels(-10.0, 0.0);
+        tx.send(ZoomResult {
+            request,
+            cache: None,
+            image,
+        })
+        .unwrap();
+        app.poll_zoom();
+        assert_eq!(
+            app.loaded.as_ref().unwrap().get_pixel(0, 0).0,
+            [60, 0, 0, 255]
+        );
+        load_zoom(&mut app);
+        assert_eq!(
+            app.loaded.as_ref().unwrap().get_pixel(0, 0).0,
+            [70, 0, 0, 255]
+        );
+
+        let request = app.zoom_request();
+        let image = request.render(&mut None);
+        let (tx, rx) = mpsc::channel();
+        app.zoom_rx = Some(rx);
+        app.current = 1;
+        app.source = Some(Arc::new(ZoomSource::Raster(DynamicImage::ImageRgba8(
+            image::RgbaImage::from_pixel(200, 100, image::Rgba([0, 255, 0, 255])),
+        ))));
+        app.source_for = Some(1);
+        app.set_loaded(None);
+        tx.send(ZoomResult {
+            request,
+            cache: None,
+            image,
+        })
+        .unwrap();
+        app.poll_zoom();
+        assert!(app.loaded.is_none());
+        load_zoom(&mut app);
+        assert_eq!(
+            app.loaded.as_ref().unwrap().get_pixel(0, 0).0,
+            [0, 255, 0, 255]
+        );
+    }
+
+    #[test]
+    fn late_source_errors_preserve_fit_but_report_active_zoom_failure() {
+        use super::{App, ViewMode};
+        use crate::image_list::SharedImageList;
+        use crate::theme::Theme;
+        use std::{io, sync::mpsc};
+
+        let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
+        app.mode = ViewMode::Fullscreen;
+        app.zoom = 2.0;
+        let (tx, rx) = mpsc::channel();
+        app.source_target = Some(app.current);
+        app.source_rx = Some(rx);
+        app.reset_zoom();
+        let fit = image::RgbaImage::from_pixel(20, 20, image::Rgba([0, 255, 0, 255]));
+        app.set_loaded(Some(fit.clone()));
+        tx.send(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zoom decode failed",
+        )))
+        .unwrap();
+        app.poll_source();
+        assert_eq!(app.loaded.as_ref(), Some(&fit));
+        assert!(app.error.is_none());
+
+        let (tx, rx) = mpsc::channel();
+        app.source_rx = Some(rx);
+        app.source_target = Some(app.current);
+        app.zoom = 2.0;
+        tx.send(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zoom decode failed",
+        )))
+        .unwrap();
+        app.poll_source();
+        app.load_if_needed();
+        assert!(app.loaded.is_none());
+        assert_eq!(app.error.as_deref(), Some("zoom decode failed"));
+    }
+
+    #[test]
+    fn cached_svg_pan_preserves_straight_alpha_and_fractional_edges() {
+        use super::{App, ZoomSource};
+        use crate::image_list::SharedImageList;
+        use crate::theme::Theme;
+        use ratatui::layout::Rect;
+        use std::sync::Arc;
+
+        let tree = resvg::usvg::Tree::from_str(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1">
+                <g opacity="0.5"><rect width="1" height="1" fill="#804020"/>
+                <rect x="1" width="1" height="1" fill="blue"/></g></svg>"##,
+            &resvg::usvg::Options::default(),
+        )
+        .unwrap();
+        let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
+        app.reset_zoom_state();
+        app.image_rect = Rect::new(0, 0, 8, 8);
+        app.source = Some(Arc::new(ZoomSource::Svg(tree)));
+        app.source_for = Some(0);
+        app.zoom = 16.0;
+        load_zoom(&mut app);
+        assert_eq!(
+            app.loaded.as_ref().unwrap().get_pixel(3, 4).0,
+            [128, 64, 32, 128]
+        );
+        app.pan_pixels(2.0, 0.0);
+        load_zoom(&mut app);
+        assert_eq!(
+            app.loaded.as_ref().unwrap().get_pixel(5, 4).0,
+            [128, 64, 32, 128]
+        );
+        assert_eq!(
+            app.loaded.as_ref().unwrap().get_pixel(6, 4).0,
+            [0, 0, 255, 128]
+        );
+        app.pan_pixels(0.5, 0.0);
+        load_zoom(&mut app);
+        let edge = app.loaded.as_ref().unwrap().get_pixel(6, 4).0;
+        assert!(edge[0] > 0 && edge[0] < 128);
+        assert!(edge[2] > 32 && edge[2] < 255);
+    }
+
     #[test]
     fn svg_renders_viewbox_at_target_size_with_straight_alpha() {
         let path =
@@ -1693,7 +2017,7 @@ mod tests {
         let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
         app.reset_zoom_state();
         app.image_rect = Rect::new(0, 0, 100, 100);
-        app.source = Some(ZoomSource::Svg(tree));
+        app.source = Some(std::sync::Arc::new(ZoomSource::Svg(tree)));
         app.zoom = 16.0;
         let view = app.build_zoom_view().unwrap();
         assert_eq!(view.get_pixel(75, 50).0, [255, 0, 0, 255]);
@@ -1743,7 +2067,7 @@ mod tests {
             assert!(Instant::now() < deadline, "SVG source decode timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
-        app.load_if_needed();
+        load_zoom(&mut app);
         let view = app.loaded.as_ref().unwrap();
         fs::remove_file(path).unwrap();
 
@@ -1776,7 +2100,9 @@ mod tests {
         .unwrap();
         let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
         app.reset_zoom_state();
-        app.source = Some(ZoomSource::Svg(parse_svg(&path).unwrap()));
+        app.source = Some(std::sync::Arc::new(ZoomSource::Svg(
+            parse_svg(&path).unwrap(),
+        )));
         fs::remove_file(path).unwrap();
         app.image_rect = Rect::new(0, 0, 8, 8);
         app.zoom = 16.0;
@@ -1821,17 +2147,17 @@ mod tests {
         let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
         app.reset_zoom_state();
         app.image_rect = Rect::new(0, 0, 1000, 1000);
-        app.source = Some(ZoomSource::Svg(tree));
+        app.source = Some(std::sync::Arc::new(ZoomSource::Svg(tree)));
         app.source_for = Some(0);
         app.zoom = 16.0;
         app.zoom_dirty = true;
-        app.load_if_needed();
+        load_zoom(&mut app);
         assert!(app.loaded.is_none());
         assert!(app.error.is_some());
 
         app.zoom = 1.25;
         app.zoom_dirty = true;
-        app.load_if_needed();
+        load_zoom(&mut app);
         let view = app.loaded.as_ref().unwrap();
         assert_eq!(view.dimensions(), (1000, 1000));
         assert_eq!(view.get_pixel(500, 500).0, [255, 0, 0, 255]);
@@ -1859,12 +2185,14 @@ mod tests {
         .unwrap();
         let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
         app.reset_zoom_state();
-        app.source = Some(ZoomSource::Svg(parse_svg(&path).unwrap()));
+        app.source = Some(std::sync::Arc::new(ZoomSource::Svg(
+            parse_svg(&path).unwrap(),
+        )));
         app.source_for = Some(0);
         fs::remove_file(path).unwrap();
         app.image_rect = Rect::new(0, 0, 20, 20);
         app.zoom = 8.0;
-        app.load_if_needed();
+        load_zoom(&mut app);
         let view = app.loaded.as_ref().unwrap();
         assert_eq!(view.dimensions(), (20, 20));
         assert_eq!(view.get_pixel(10, 10).0, [255, 0, 0, 255]);
@@ -1876,12 +2204,12 @@ mod tests {
             std::io::ErrorKind::InvalidData
         );
         app.zoom_dirty = true;
-        app.load_if_needed();
+        load_zoom(&mut app);
         assert!(app.loaded.is_none());
         assert!(app.error.is_some());
         app.cell_px = (1, 1);
         app.zoom_dirty = true;
-        app.load_if_needed();
+        load_zoom(&mut app);
         assert_eq!(
             app.loaded.as_ref().unwrap().get_pixel(10, 10).0,
             [255, 0, 0, 255]
@@ -1950,7 +2278,9 @@ mod tests {
         let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
         app.image_rect = Rect::new(0, 0, 100, 100);
         // 400x400 source, viewport 100x100 -> fit scale 0.25 (base image is 100x100).
-        app.source = Some(super::ZoomSource::Raster(DynamicImage::new_rgba8(400, 400)));
+        app.source = Some(std::sync::Arc::new(super::ZoomSource::Raster(
+            DynamicImage::new_rgba8(400, 400),
+        )));
         app.source_for = Some(0);
         app.current = 0;
 
@@ -1971,8 +2301,10 @@ mod tests {
         let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
         app.reset_zoom_state();
         app.image_rect = Rect::new(0, 0, 100, 100);
-        app.source = Some(super::ZoomSource::Raster(DynamicImage::ImageRgba8(
-            image::RgbaImage::from_fn(200, 100, |x, y| image::Rgba([x as u8, y as u8, 0, 255])),
+        app.source = Some(std::sync::Arc::new(super::ZoomSource::Raster(
+            DynamicImage::ImageRgba8(image::RgbaImage::from_fn(200, 100, |x, y| {
+                image::Rgba([x as u8, y as u8, 0, 255])
+            })),
         )));
         app.zoom = 2.0;
 
@@ -2009,7 +2341,9 @@ mod tests {
         let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
         app.reset_zoom_state();
         app.image_rect = Rect::new(0, 0, 100, 50);
-        app.source = Some(super::ZoomSource::Raster(DynamicImage::new_rgba8(400, 200)));
+        app.source = Some(std::sync::Arc::new(super::ZoomSource::Raster(
+            DynamicImage::new_rgba8(400, 200),
+        )));
         app.zoom = 2.0;
         app.pan_pixels(10.0, -5.0);
         assert!((app.pan_x - 0.4).abs() < 1e-10);

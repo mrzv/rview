@@ -25,9 +25,9 @@ use crossterm::{
 use encoder::GraphicsBackend;
 use image_list::SharedImageList;
 use ratatui::prelude::*;
-use std::io::{self, Write, stdout};
+use std::io::{self, BufWriter, Write, stdout};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "rview", about = "A fast terminal image viewer")]
@@ -200,12 +200,61 @@ fn initial_dir_from_paths(paths: &[PathBuf]) -> PathBuf {
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     let mut pending_emits: Vec<usize> = Vec::new();
     let mut mouse_drag = None;
+    let fullscreen_frame_interval = Duration::from_nanos(16_666_667);
+    let mut next_fullscreen_frame = Instant::now();
+    let mut fullscreen_view = None;
+    let mut displayed_fullscreen = None;
 
     loop {
-        // 1. Drain all buffered input first so navigation is never blocked
-        while event::poll(Duration::ZERO)? {
-            if handle_event(app, event::read()?, &mut mouse_drag)? {
+        // Bound each drain so a continuous mouse stream cannot starve workers.
+        let input_deadline = Instant::now() + Duration::from_millis(4);
+        for _ in 0..64 {
+            if Instant::now() >= input_deadline || !event::poll(Duration::ZERO)? {
+                break;
+            }
+            let input = event::read()?;
+            let previous_view = (
+                app.mode,
+                app.current,
+                app.help_visible,
+                app.theme_picker.is_some(),
+            );
+            let explicit_clear = matches!(
+                &input,
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && ((app.mode == ViewMode::Fullscreen
+                            && matches!(key.code, KeyCode::Home | KeyCode::End))
+                            || (app.pending_delete.is_some()
+                                && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))))
+            );
+            let reset_to_fit = app.mode == ViewMode::Fullscreen
+                && app.zoom > 1.0
+                && matches!(
+                    &input,
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('0')
+                );
+            if handle_event(app, input, &mut mouse_drag)? {
                 return Ok(());
+            }
+            if previous_view
+                != (
+                    app.mode,
+                    app.current,
+                    app.help_visible,
+                    app.theme_picker.is_some(),
+                )
+                || explicit_clear
+            {
+                displayed_fullscreen = None;
+                next_fullscreen_frame = Instant::now();
+                if explicit_clear && app.mode == ViewMode::Fullscreen {
+                    // Home/End can delete graphics without changing the index.
+                    app.needs_render = true;
+                }
+            } else if reset_to_fit && app.zoom == 1.0 {
+                next_fullscreen_frame = Instant::now();
             }
         }
 
@@ -214,6 +263,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         app.poll_filter();
         app.poll_fullscreen();
         app.poll_source();
+        app.poll_zoom();
         app.prefetcher.poll();
         pending_emits.extend(app.poll_thumbnails());
 
@@ -234,12 +284,27 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
         // 3. Draw UI chrome (always fast — ratatui only)
         terminal.draw(|frame| ui::draw(frame, app))?;
+        if app.mode == ViewMode::Fullscreen {
+            let view = (app.current, app.image_rect, app.cell_px);
+            if fullscreen_view != Some(view) {
+                fullscreen_view = Some(view);
+                displayed_fullscreen = None;
+                next_fullscreen_frame = Instant::now();
+            }
+        } else {
+            fullscreen_view = None;
+            displayed_fullscreen = None;
+        }
 
         // 4. Render Kitty images
-        if app.theme_picker.is_some() || app.mode == ViewMode::Picker {
+        if app.theme_picker.is_some() || app.help_visible || app.mode == ViewMode::Picker {
             app.needs_render = false;
+            displayed_fullscreen = None;
             pending_emits.clear();
-        } else if app.needs_render && !app.images.is_empty() {
+        } else if app.needs_render
+            && !app.images.is_empty()
+            && (app.mode != ViewMode::Fullscreen || Instant::now() >= next_fullscreen_frame)
+        {
             #[cfg(feature = "video")]
             let is_video = matches!(app.mode, ViewMode::Video);
             #[cfg(not(feature = "video"))]
@@ -248,7 +313,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             match app.mode {
                 ViewMode::Fullscreen => {
                     app.load_if_needed();
-                    render_fullscreen_image(app)?;
+                    // A pending request keeps the previous terminal image intact.
+                    // Dirty input alone is not a newly published image.
+                    let frame = (
+                        app.loaded_revision,
+                        app.current,
+                        app.image_rect,
+                        app.cell_px,
+                    );
+                    if displayed_fullscreen != Some(frame)
+                        && (app.loaded.is_some() || !app.zoom_render_pending())
+                    {
+                        render_fullscreen_image(app)?;
+                        displayed_fullscreen = Some(frame);
+                    }
+                    next_fullscreen_frame = Instant::now() + fullscreen_frame_interval;
                     app.prefetcher.set_target_hint(app.image_rect, app.cell_px);
                     app.prefetcher.kick(app.current, &app.images);
                 }
@@ -273,8 +352,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             emit_new_thumbnails(app, &batch)?;
         }
 
-        // 5. Wait for next event (shorter timeout when thumbnails are pending)
-        let timeout = {
+        // Wake promptly for worker results and for the final coalesced motion,
+        // even when the input stream has stopped.
+        let mut timeout = {
             #[cfg(feature = "video")]
             if let Some(ref v) = app.video {
                 v.time_until_next_frame()
@@ -290,6 +370,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 Duration::from_millis(50)
             }
         };
+        if app.zoom_render_pending() {
+            timeout = timeout.min(Duration::from_millis(16));
+        }
+        if app.needs_render
+            && app.mode == ViewMode::Fullscreen
+            && app.theme_picker.is_none()
+            && !app.help_visible
+            && !app.images.is_empty()
+        {
+            timeout = timeout.min(next_fullscreen_frame.saturating_duration_since(Instant::now()));
+        }
         event::poll(timeout)?;
     }
 }
@@ -728,7 +819,7 @@ fn query_cell_pixel_size() -> (u32, u32) {
 fn render_fullscreen_image(app: &mut App) -> io::Result<()> {
     use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
-    let mut out = io::stdout().lock();
+    let mut out = BufWriter::with_capacity(64 * 1024, io::stdout().lock());
     // Wrap the delete + retransmit in a synchronized update so the terminal swaps
     // atomically instead of briefly showing a blank viewport (visible as flicker
     // when zooming or panning, which redraw rapidly).
