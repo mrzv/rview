@@ -52,9 +52,9 @@ Mouse navigation is inactive in dialogs and outside fullscreen image viewing.
 
 **Images:** PNG, JPEG, GIF, WebP, BMP, TIFF, ICO, AVIF, SVG.
 
-SVGs render as static images with transparency, system fonts, and local image references resolved relative to the SVG file. Thumbnails rasterize at the target size; fullscreen fit does not upscale beyond the SVG's intrinsic dimensions. Zoom and pan re-render the vector image at the visible viewport's pixel resolution, preserving detail instead of enlarging an intrinsic-resolution raster.
+SVGs render as static images with transparency, system fonts, and local image references resolved relative to the SVG file. Thumbnails rasterize at the target size; fullscreen fit does not upscale beyond the SVG's intrinsic dimensions. Zoom renders vectors at the displayed pixel resolution, preserving detail instead of enlarging an intrinsic-resolution raster. Zoom and pan rendering runs in the background, coalescing input to the latest requested view.
 
-SVG thumbnails are cached only in memory so changes to referenced files appear when reopening the gallery. SVG raster buffers use the same 512 MiB allocation limit as the standard image decoder. Zoom without filters allocates only the visible viewport, so oversized intrinsic dimensions do not require oversized raster buffers. SVG filters render on a full zoomed canvas before cropping, preserving effects whose inputs lie outside the viewport; that canvas and the visible crop share the allocation limit.
+SVG thumbnails are cached only in memory so changes to referenced files appear when reopening the gallery. SVG raster buffers use the same 512 MiB allocation limit as the standard image decoder. Zoom retains a rendered canvas for panning when it fits that budget; whole-pixel pans crop it without re-rasterizing, while scale or subpixel changes re-render. Unfiltered SVGs fall back to viewport-only rendering when the full canvas would exceed the limit. SVG filters require the full zoomed canvas to preserve inputs outside the viewport; that canvas and the visible crop share the allocation limit.
 
 **Video** (`--features video`): MP4, MOV, MKV, AVI, WebM, M4V. Playback loops at up to 10 fps. Gallery thumbnails use the first frame.
 
