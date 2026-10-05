@@ -40,9 +40,13 @@ Themes load from `~/.config/rview/config.toml` (`theme`, `theme_catalog`). `-t` 
 | `o` | Directory picker |
 | `t` | Theme picker |
 | `+` `-` `0` | Zoom in, out, fit. `hjkl` pans when zoomed |
+| Mouse wheel | Zoom in / out over the fullscreen image viewport |
+| Left-button drag | Pan the zoomed fullscreen image |
 | `Esc` | Back, or quit from the gallery |
 | `q` | Quit |
 | `?` | Full help |
+
+Mouse navigation is inactive in dialogs and outside fullscreen image viewing.
 
 ## Formats
 
