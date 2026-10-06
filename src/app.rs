@@ -104,7 +104,7 @@ struct ZoomRequest {
 
 struct SvgZoomCache {
     transform: resvg::tiny_skia::Transform,
-    pixmap: resvg::tiny_skia::Pixmap,
+    image: RgbaImage,
 }
 
 struct ZoomResult {
@@ -152,14 +152,8 @@ impl ZoomRequest {
                 tree,
                 dst_w,
                 dst_h,
-                resvg::tiny_skia::Transform::from_row(
-                    crop.scale as f32,
-                    0.0,
-                    0.0,
-                    crop.scale as f32,
-                    -(x * crop.scale) as f32,
-                    -(y * crop.scale) as f32,
-                ),
+                crop.scale,
+                (x * crop.scale, y * crop.scale),
                 cache,
             ),
         }
@@ -1385,22 +1379,39 @@ fn decode_svg(path: &Path, target: Option<(u32, u32)>) -> io::Result<DynamicImag
     .map(DynamicImage::ImageRgba8)
 }
 
-/// Cache exact-resolution SVG pixels; integer mouse movement only changes the crop.
+/// Cache exact-resolution straight RGBA so whole-pixel panning only copies its crop.
 fn render_svg_cached(
     tree: &resvg::usvg::Tree,
     width: u32,
     height: u32,
-    mut transform: resvg::tiny_skia::Transform,
+    scale: f64,
+    origin: (f64, f64),
     cache: &mut Option<SvgZoomCache>,
 ) -> io::Result<RgbaImage> {
-    let viewport_transform = transform;
-    // Keep the fractional phase in the canvas; never interpolate a cached raster.
-    let left = (-transform.tx).ceil().max(0.0) as u32;
-    let top = (-transform.ty).ceil().max(0.0) as u32;
+    // Extract phase before narrowing to f32: large translations otherwise lose
+    // fractional precision and make identical whole-pixel pans miss the cache.
+    let snap_roundoff = |value: f64| {
+        let rounded = value.round();
+        if (value - rounded).abs() <= value.abs().max(1.0) * f64::EPSILON * 16.0 {
+            rounded
+        } else {
+            value
+        }
+    };
+    let x = snap_roundoff(origin.0);
+    let y = snap_roundoff(origin.1);
+    let left = x.ceil().max(0.0) as u32;
+    let top = y.ceil().max(0.0) as u32;
     let crop = resvg::tiny_skia::IntRect::from_xywh(left as i32, top as i32, width, height)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SVG crop dimensions"))?;
-    transform.tx += left as f32;
-    transform.ty += top as f32;
+    let transform = resvg::tiny_skia::Transform::from_row(
+        scale as f32,
+        0.0,
+        0.0,
+        scale as f32,
+        (f64::from(left) - x) as f32,
+        (f64::from(top) - y) as f32,
+    );
     let full_width = ((tree.size().width() * transform.sx + transform.tx).ceil() as u32)
         .max(crop.right() as u32);
     let full_height = ((tree.size().height() * transform.sy + transform.ty).ceil() as u32)
@@ -1409,28 +1420,33 @@ fn render_svg_cached(
         *cache = None;
         if tree.filters().is_empty() {
             // Large unfiltered drawings still render only their visible viewport.
+            let viewport_transform = resvg::tiny_skia::Transform::from_row(
+                scale as f32,
+                0.0,
+                0.0,
+                scale as f32,
+                -x as f32,
+                -y as f32,
+            );
             return render_svg(tree, width, height, viewport_transform, None);
         }
         return Err(error);
     }
     let reusable = cache.as_ref().is_some_and(|cached| {
         cached.transform == transform
-            && cached.pixmap.width() == full_width
-            && cached.pixmap.height() == full_height
+            && cached.image.width() == full_width
+            && cached.image.height() == full_height
     });
     if !reusable {
         // Release the old canvas before allocating a new zoom/phase.
         *cache = None;
-        let pixmap = render_svg_pixmap(tree, full_width, full_height, transform)?;
-        *cache = Some(SvgZoomCache { transform, pixmap });
+        let image = rgba_from_pixmap(render_svg_pixmap(tree, full_width, full_height, transform)?)?;
+        *cache = Some(SvgZoomCache { transform, image });
     }
-    let viewport = cache
-        .as_ref()
-        .unwrap()
-        .pixmap
-        .clone_rect(crop)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SVG crop dimensions"))?;
-    rgba_from_pixmap(viewport)
+    Ok(
+        image::imageops::crop_imm(&cache.as_ref().unwrap().image, left, top, width, height)
+            .to_image(),
+    )
 }
 
 fn render_svg(
