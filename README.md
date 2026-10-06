@@ -52,7 +52,7 @@ Mouse navigation is inactive in dialogs and outside fullscreen image viewing.
 
 **Images:** PNG, JPEG, GIF, WebP, BMP, TIFF, ICO, AVIF, SVG.
 
-SVGs render as static images with transparency, system fonts, and local image references resolved relative to the SVG file. Thumbnails rasterize at the target size; fullscreen fit does not upscale beyond the SVG's intrinsic dimensions. Zoom renders vectors at the displayed pixel resolution, preserving detail instead of enlarging an intrinsic-resolution raster. Zoom and pan rendering runs in the background, coalescing input to the latest requested view.
+SVGs render as static images with transparency, system fonts, and local image references resolved relative to the SVG file. Thumbnails rasterize at the target size; fullscreen fit does not upscale beyond the SVG's intrinsic dimensions. Zoom renders vectors at the displayed pixel resolution, preserving detail instead of enlarging an intrinsic-resolution raster. Zoom and pan rendering runs in the background, prioritizing the latest requested view: obsolete results are skipped, and reusable SVG canvases crop directly to the newest pan position. Ready frames publish immediately, without a fixed animation cadence.
 
 Fullscreen keeps the previous image visible while rendering and transferring its replacement, then swaps placements after the transfer finishes. Lossless PNG uploads and streamed encoding reduce terminal traffic.
 
