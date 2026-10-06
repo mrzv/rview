@@ -221,8 +221,6 @@ struct FullscreenImage {
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     let mut pending_emits: Vec<usize> = Vec::new();
     let mut mouse_drag = None;
-    let fullscreen_frame_interval = Duration::from_nanos(16_666_667);
-    let mut next_fullscreen_frame = Instant::now();
     let mut fullscreen_view = None;
     let mut displayed_fullscreen = None;
     let mut fullscreen_image = None;
@@ -250,13 +248,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             || (app.pending_delete.is_some()
                                 && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))))
             );
-            let reset_to_fit = app.mode == ViewMode::Fullscreen
-                && app.zoom > 1.0
-                && matches!(
-                    &input,
-                    Event::Key(key)
-                        if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('0')
-                );
             if handle_event(app, input, &mut mouse_drag)? {
                 return Ok(());
             }
@@ -270,13 +261,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 || explicit_clear
             {
                 displayed_fullscreen = None;
-                next_fullscreen_frame = Instant::now();
                 if explicit_clear && app.mode == ViewMode::Fullscreen {
                     // Home/End can delete graphics without changing the index.
                     app.needs_render = true;
                 }
-            } else if reset_to_fit && app.zoom == 1.0 {
-                next_fullscreen_frame = Instant::now();
             }
         }
 
@@ -296,7 +284,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         {
             fullscreen_image = None;
             displayed_fullscreen = None;
-            next_fullscreen_frame = Instant::now();
             if app.mode == ViewMode::Fullscreen {
                 app.needs_render = true;
             }
@@ -335,7 +322,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             if fullscreen_view != Some(view) {
                 fullscreen_view = Some(view);
                 displayed_fullscreen = None;
-                next_fullscreen_frame = Instant::now();
             }
         } else {
             fullscreen_view = None;
@@ -348,8 +334,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             && app.theme_picker.is_none()
             && !app.help_visible
         {
-            // Compute against the latest viewport immediately; only publication
-            // is frame-paced, so a cheap cached crop can finish before its slot.
+            // Compute and publish the newest available view without a frame delay.
             app.load_if_needed();
         }
 
@@ -358,10 +343,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             app.needs_render = false;
             displayed_fullscreen = None;
             pending_emits.clear();
-        } else if app.needs_render
-            && !app.images.is_empty()
-            && (app.mode != ViewMode::Fullscreen || Instant::now() >= next_fullscreen_frame)
-        {
+        } else if app.needs_render && !app.images.is_empty() {
             #[cfg(feature = "video")]
             let is_video = matches!(app.mode, ViewMode::Video);
             #[cfg(not(feature = "video"))]
@@ -382,7 +364,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     {
                         render_fullscreen_image(app, &mut fullscreen_image)?;
                         displayed_fullscreen = Some(frame);
-                        next_fullscreen_frame = Instant::now() + fullscreen_frame_interval;
                     }
                     app.prefetcher.set_target_hint(app.image_rect, app.cell_px);
                     app.prefetcher.kick(app.current, &app.images);
@@ -428,14 +409,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         };
         if app.zoom_render_pending() {
             timeout = timeout.min(Duration::from_millis(4));
-        }
-        if app.needs_render
-            && app.mode == ViewMode::Fullscreen
-            && app.theme_picker.is_none()
-            && !app.help_visible
-            && !app.images.is_empty()
-        {
-            timeout = timeout.min(next_fullscreen_frame.saturating_duration_since(Instant::now()));
         }
         event::poll(timeout)?;
     }

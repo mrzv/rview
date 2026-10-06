@@ -121,7 +121,7 @@ impl ZoomRequest {
             && self.zoom == app.zoom
     }
 
-    fn render(&self, cache: &mut Option<SvgZoomCache>) -> io::Result<RgbaImage> {
+    fn viewport(&self) -> io::Result<(ZoomCrop, u32, u32)> {
         let (vw, vh) = (
             (u32::from(self.rect.width) * self.cell_px.0).max(1),
             (u32::from(self.rect.height) * self.cell_px.1).max(1),
@@ -134,10 +134,33 @@ impl ZoomRequest {
             ));
         }
         let crop = self.source.crop(self.zoom, vw, vh);
-        let x = self.pan_x * crop.max_x;
-        let y = self.pan_y * crop.max_y;
         let dst_w = ((crop.width * crop.scale).round() as u32).max(1).min(vw);
         let dst_h = ((crop.height * crop.scale).round() as u32).max(1).min(vh);
+        Ok((crop, dst_w, dst_h))
+    }
+
+    fn cached_image(&self, cache: &SvgZoomCache) -> io::Result<Option<RgbaImage>> {
+        let ZoomSource::Svg(tree) = self.source.as_ref() else {
+            return Ok(None);
+        };
+        let (crop, width, height) = self.viewport()?;
+        let view = SvgViewport::new(
+            tree,
+            width,
+            height,
+            crop.scale,
+            (
+                self.pan_x * crop.max_x * crop.scale,
+                self.pan_y * crop.max_y * crop.scale,
+            ),
+        )?;
+        Ok(view.cached_image(cache))
+    }
+
+    fn render(&self, cache: &mut Option<SvgZoomCache>) -> io::Result<RgbaImage> {
+        let (crop, dst_w, dst_h) = self.viewport()?;
+        let x = self.pan_x * crop.max_x;
+        let y = self.pan_y * crop.max_y;
         match self.source.as_ref() {
             ZoomSource::Raster(image) => {
                 let cropped = image.crop_imm(
@@ -723,22 +746,37 @@ impl App {
         if same_source && self.mode == ViewMode::Fullscreen && self.zoom > 1.0 {
             self.zoom_cache = result.cache;
             let same_pan = result.request.pan_x == self.pan_x && result.request.pan_y == self.pan_y;
-            if result.request.matches(self) {
+            let same_view = result.request.matches(self);
+            if same_view && same_pan {
                 match result.image {
                     Ok(image) => {
                         self.set_loaded(Some(image));
                         self.error = None;
                     }
-                    Err(error) if same_pan => {
+                    Err(error) => {
                         self.set_loaded(None);
                         self.error = Some(error.to_string());
                     }
-                    Err(_) => {}
                 }
                 self.loaded_for_rect = self.image_rect;
-                // Publish completed motion in order rather than starving continuous
-                // drags. The desired pan stays untouched; catch up after this frame.
-                self.zoom_dirty = !same_pan;
+                self.zoom_dirty = false;
+            } else if same_view {
+                drop(result.image);
+                // Re-project a completed SVG canvas to the latest pointer position
+                // without another render or publishing an obsolete crop.
+                let latest = self.zoom_request();
+                let image = self
+                    .zoom_cache
+                    .as_ref()
+                    .and_then(|cache| latest.cached_image(cache).ok().flatten());
+                if let Some(image) = image {
+                    self.set_loaded(Some(image));
+                    self.error = None;
+                    self.loaded_for_rect = self.image_rect;
+                    self.zoom_dirty = false;
+                } else {
+                    self.zoom_dirty = true;
+                }
             } else {
                 self.zoom_dirty = true;
             }
@@ -1379,6 +1417,80 @@ fn decode_svg(path: &Path, target: Option<(u32, u32)>) -> io::Result<DynamicImag
     .map(DynamicImage::ImageRgba8)
 }
 
+struct SvgViewport {
+    crop: resvg::tiny_skia::IntRect,
+    transform: resvg::tiny_skia::Transform,
+    full_width: u32,
+    full_height: u32,
+    origin: (f64, f64),
+}
+
+impl SvgViewport {
+    fn new(
+        tree: &resvg::usvg::Tree,
+        width: u32,
+        height: u32,
+        scale: f64,
+        origin: (f64, f64),
+    ) -> io::Result<Self> {
+        // Preserve fractional phase before narrowing large translations to f32.
+        let snap_roundoff = |value: f64| {
+            let rounded = value.round();
+            if (value - rounded).abs() <= value.abs().max(1.0) * f64::EPSILON * 16.0 {
+                rounded
+            } else {
+                value
+            }
+        };
+        let x = snap_roundoff(origin.0);
+        let y = snap_roundoff(origin.1);
+        let left = x.ceil().max(0.0) as u32;
+        let top = y.ceil().max(0.0) as u32;
+        let crop = resvg::tiny_skia::IntRect::from_xywh(left as i32, top as i32, width, height)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid SVG crop dimensions")
+            })?;
+        let transform = resvg::tiny_skia::Transform::from_row(
+            scale as f32,
+            0.0,
+            0.0,
+            scale as f32,
+            (f64::from(left) - x) as f32,
+            (f64::from(top) - y) as f32,
+        );
+        let full_width = ((tree.size().width() * transform.sx + transform.tx).ceil() as u32)
+            .max(crop.right() as u32);
+        let full_height = ((tree.size().height() * transform.sy + transform.ty).ceil() as u32)
+            .max(crop.bottom() as u32);
+        Ok(Self {
+            crop,
+            transform,
+            full_width,
+            full_height,
+            origin: (x, y),
+        })
+    }
+
+    fn cached_image(&self, cache: &SvgZoomCache) -> Option<RgbaImage> {
+        if cache.transform != self.transform
+            || cache.image.width() != self.full_width
+            || cache.image.height() != self.full_height
+        {
+            return None;
+        }
+        Some(
+            image::imageops::crop_imm(
+                &cache.image,
+                self.crop.x() as u32,
+                self.crop.y() as u32,
+                self.crop.width(),
+                self.crop.height(),
+            )
+            .to_image(),
+        )
+    }
+}
+
 /// Cache exact-resolution straight RGBA so whole-pixel panning only copies its crop.
 fn render_svg_cached(
     tree: &resvg::usvg::Tree,
@@ -1388,35 +1500,8 @@ fn render_svg_cached(
     origin: (f64, f64),
     cache: &mut Option<SvgZoomCache>,
 ) -> io::Result<RgbaImage> {
-    // Extract phase before narrowing to f32: large translations otherwise lose
-    // fractional precision and make identical whole-pixel pans miss the cache.
-    let snap_roundoff = |value: f64| {
-        let rounded = value.round();
-        if (value - rounded).abs() <= value.abs().max(1.0) * f64::EPSILON * 16.0 {
-            rounded
-        } else {
-            value
-        }
-    };
-    let x = snap_roundoff(origin.0);
-    let y = snap_roundoff(origin.1);
-    let left = x.ceil().max(0.0) as u32;
-    let top = y.ceil().max(0.0) as u32;
-    let crop = resvg::tiny_skia::IntRect::from_xywh(left as i32, top as i32, width, height)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SVG crop dimensions"))?;
-    let transform = resvg::tiny_skia::Transform::from_row(
-        scale as f32,
-        0.0,
-        0.0,
-        scale as f32,
-        (f64::from(left) - x) as f32,
-        (f64::from(top) - y) as f32,
-    );
-    let full_width = ((tree.size().width() * transform.sx + transform.tx).ceil() as u32)
-        .max(crop.right() as u32);
-    let full_height = ((tree.size().height() * transform.sy + transform.ty).ceil() as u32)
-        .max(crop.bottom() as u32);
-    if let Err(error) = reserve_svg_buffers(full_width, full_height, Some(crop)) {
+    let view = SvgViewport::new(tree, width, height, scale, origin)?;
+    if let Err(error) = reserve_svg_buffers(view.full_width, view.full_height, Some(view.crop)) {
         *cache = None;
         if tree.filters().is_empty() {
             // Large unfiltered drawings still render only their visible viewport.
@@ -1425,28 +1510,29 @@ fn render_svg_cached(
                 0.0,
                 0.0,
                 scale as f32,
-                -x as f32,
-                -y as f32,
+                -view.origin.0 as f32,
+                -view.origin.1 as f32,
             );
             return render_svg(tree, width, height, viewport_transform, None);
         }
         return Err(error);
     }
-    let reusable = cache.as_ref().is_some_and(|cached| {
-        cached.transform == transform
-            && cached.image.width() == full_width
-            && cached.image.height() == full_height
-    });
-    if !reusable {
-        // Release the old canvas before allocating a new zoom/phase.
-        *cache = None;
-        let image = rgba_from_pixmap(render_svg_pixmap(tree, full_width, full_height, transform)?)?;
-        *cache = Some(SvgZoomCache { transform, image });
+    if let Some(image) = cache.as_ref().and_then(|cache| view.cached_image(cache)) {
+        return Ok(image);
     }
-    Ok(
-        image::imageops::crop_imm(&cache.as_ref().unwrap().image, left, top, width, height)
-            .to_image(),
-    )
+    // Release the old canvas before allocating a new zoom/phase.
+    *cache = None;
+    let image = rgba_from_pixmap(render_svg_pixmap(
+        tree,
+        view.full_width,
+        view.full_height,
+        view.transform,
+    )?)?;
+    *cache = Some(SvgZoomCache {
+        transform: view.transform,
+        image,
+    });
+    Ok(view.cached_image(cache.as_ref().unwrap()).unwrap())
 }
 
 fn render_svg(
@@ -1774,7 +1860,7 @@ mod tests {
         app.poll_zoom();
         assert_eq!(
             app.loaded.as_ref().unwrap().get_pixel(0, 0).0,
-            [60, 0, 0, 255]
+            [50, 0, 0, 255]
         );
         load_zoom(&mut app);
         assert_eq!(
@@ -1805,6 +1891,66 @@ mod tests {
             app.loaded.as_ref().unwrap().get_pixel(0, 0).0,
             [0, 255, 0, 255]
         );
+    }
+
+    #[test]
+    fn completed_svg_canvas_tracks_latest_pan_without_publishing_old_crops() {
+        use super::{App, ZoomResult, ZoomSource};
+        use crate::image_list::SharedImageList;
+        use crate::theme::Theme;
+        use ratatui::layout::Rect;
+        use std::sync::{Arc, mpsc};
+
+        let tree = resvg::usvg::Tree::from_str(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+                <rect x="50" width="10" height="100" fill="red"/></svg>"#,
+            &resvg::usvg::Options::default(),
+        )
+        .unwrap();
+        let mut app = App::new(Theme::fallback(), (1, 1), SharedImageList::new());
+        app.reset_zoom_state();
+        app.image_rect = Rect::new(0, 0, 100, 100);
+        app.source = Some(Arc::new(ZoomSource::Svg(tree)));
+        app.source_for = Some(0);
+        app.zoom = 2.0;
+        load_zoom(&mut app);
+
+        app.pan_pixels(-10.0, 0.0);
+        let request = app.zoom_request();
+        let mut cache = app.zoom_cache.take();
+        let image = request.render(&mut cache);
+        let (tx, rx) = mpsc::channel();
+        app.zoom_rx = Some(rx);
+        app.pan_pixels(-10.0, 0.0);
+        tx.send(ZoomResult {
+            request,
+            cache,
+            image,
+        })
+        .unwrap();
+        app.poll_zoom();
+        let latest = app.loaded.as_ref().unwrap();
+        assert_eq!(latest.get_pixel(30, 50).0, [255, 0, 0, 255]);
+        assert_eq!(latest.get_pixel(50, 50).0, [0, 0, 0, 0]);
+
+        let previous = latest.clone();
+        let request = app.zoom_request();
+        let mut cache = app.zoom_cache.take();
+        let image = request.render(&mut cache);
+        let (tx, rx) = mpsc::channel();
+        app.zoom_rx = Some(rx);
+        app.pan_pixels(-0.5, 0.0);
+        tx.send(ZoomResult {
+            request,
+            cache,
+            image,
+        })
+        .unwrap();
+        app.poll_zoom();
+        assert_eq!(app.loaded.as_ref(), Some(&previous));
+        load_zoom(&mut app);
+        let alpha = app.loaded.as_ref().unwrap().get_pixel(29, 50).0[3];
+        assert!(alpha > 0 && alpha < 255);
     }
 
     #[test]
